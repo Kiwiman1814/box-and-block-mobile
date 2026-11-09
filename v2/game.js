@@ -213,11 +213,49 @@ function startTouch() {
 // ---------------------------------------------------------------------------
 // Hand detection (one call per new video frame) -> state.hand in screen px
 // ---------------------------------------------------------------------------
+// On-screen diagnostics line (tap it to force the CPU engine).
+const diag = document.createElement("div");
+diag.style.cssText = "position:fixed;left:8px;bottom:calc(6px + env(safe-area-inset-bottom));z-index:20;" +
+  "font:600 11px/1.3 system-ui,sans-serif;color:#cfe;background:rgba(0,0,0,.55);padding:4px 8px;border-radius:8px;" +
+  "max-width:calc(100vw - 16px);pointer-events:auto";
+diag.hidden = true;
+diag.addEventListener("click", () => { if (state.tracker && state.tracker.useCpu) state.tracker.useCpu("tapped"); });
+document.body.appendChild(diag);
+const dstat = { t0: 0, calls0: 0, hands0: 0, rate: 0, found: 0, gpuSince: 0, gpuCalls0: 0 };
+
+function updateDiag(now) {
+  const trk = state.tracker;
+  diag.hidden = !(state.useCamera && trk && state.stream);
+  if (diag.hidden) return;
+  const s = trk.stats || { calls: 0, hands: 0, ms: 0, error: "" };
+  if (now - dstat.t0 >= 1000) {
+    const dt = (now - dstat.t0) / 1000;
+    dstat.rate = (s.calls - dstat.calls0) / dt;
+    dstat.found = s.calls > dstat.calls0 ? (s.hands - dstat.hands0) / (s.calls - dstat.calls0) : 0;
+    dstat.t0 = now; dstat.calls0 = s.calls; dstat.hands0 = s.hands;
+  }
+  // GPU engine that never finds a hand (known on some phones, esp. iPhone):
+  // after ~6 s and 40+ frames with zero hands, switch to CPU automatically.
+  if (trk.delegate === "GPU" && !trk.switching) {
+    if (!dstat.gpuSince) { dstat.gpuSince = now; dstat.gpuCalls0 = s.calls; dstat.gpuHands0 = s.hands; }
+    if (s.hands > dstat.gpuHands0) dstat.gpuSince = -1;             // GPU works: stop watching
+    else if (dstat.gpuSince > 0 && now - dstat.gpuSince > 6000 && s.calls - dstat.gpuCalls0 > 40) {
+      trk.useCpu("GPU found no hand in 6 s"); flash("Switching hand tracker to CPU mode…", 2000);
+    }
+  }
+  const vs = video.videoWidth ? `${video.videoWidth}×${video.videoHeight}` : "no video";
+  diag.textContent = `${trk.switching ? "switching…" : trk.delegate} · ${dstat.rate.toFixed(0)} fps · ` +
+    `${s.ms.toFixed(0)} ms · hand ${Math.round(dstat.found * 100)}% · ${vs}` +
+    (s.error ? ` · err: ${s.error}` : "") + (trk.delegate === "GPU" ? " · tap = CPU" : "");
+}
+
 function detectHand(now) {
   let res = null;
   if (state.useCamera) {
     if (state.tracker && state.stream && video.readyState >= 2 && video.videoWidth) {
-      if (video.currentTime !== state.lastVideoTime) {
+      // New frame? Some phones barely advance currentTime for live camera
+      // streams, so also run at least every 40 ms.
+      if (video.currentTime !== state.lastVideoTime || now - state.lastDetect >= 40) {
         state.lastVideoTime = video.currentTime;
         const t = Math.max(now, state.lastDetect + 1);   // tracker needs strictly increasing timestamps
         state.lastDetect = t;
@@ -268,12 +306,17 @@ function drawSkeleton(res) {
   if (!lm || lm.length < 21) return;
   const pts = lm.map(toScreen);
   g.save();
-  g.strokeStyle = "rgba(232,238,244,0.45)"; g.lineWidth = 2; g.lineCap = "round";
+  g.lineCap = "round";
+  g.strokeStyle = "rgba(0,0,0,0.5)"; g.lineWidth = 7;            // dark outline so it shows on any background
   g.beginPath();
   for (const [a, b] of BONES) { g.moveTo(pts[a].x, pts[a].y); g.lineTo(pts[b].x, pts[b].y); }
   g.stroke();
-  g.fillStyle = "rgba(74,124,255,0.7)";
-  for (const p of pts) { g.beginPath(); g.arc(p.x, p.y, 3, 0, Math.PI * 2); g.fill(); }
+  g.strokeStyle = "rgba(120,230,170,0.95)"; g.lineWidth = 3.5;
+  g.stroke();
+  g.fillStyle = "#4a7cff";
+  for (const p of pts) { g.beginPath(); g.arc(p.x, p.y, 4, 0, Math.PI * 2); g.fill(); }
+  g.fillStyle = "#ffffff";
+  for (const i of [4, 8, 12, 16, 20]) { g.beginPath(); g.arc(pts[i].x, pts[i].y, 6, 0, Math.PI * 2); g.fill(); }
   g.restore();
 }
 
@@ -609,6 +652,7 @@ function step(nowMs) {
   state.lastNow = now;
 
   detectHand(now);
+  updateDiag(now);
   const L = state.screen === "play" ? state.level : null;
   if (L) {
     if (!L.started) { L.started = true; L.start(now); }

@@ -280,10 +280,13 @@ export async function createTracker(opts = {}) {
     return 'other';
   }
 
-  function fallbackToCpu() {
+  // Counters for the on-screen diagnostics line.
+  const stats = { calls: 0, hands: 0, ms: 0, error: '' };
+
+  function fallbackToCpu(reason) {
     if (switching || delegate === 'CPU') return;
     switching = true;
-    console.warn('[tracker] GPU detection failed, switching to CPU');
+    console.warn('[tracker] switching to CPU:', reason || 'GPU detection failed');
     make('CPU')
       .then((lmk) => {
         if (closed) {
@@ -314,18 +317,23 @@ export async function createTracker(opts = {}) {
     lastTs = ts;
 
     let res;
+    const t0 = performance.now();
     try {
       res = landmarker.detectForVideo(source, ts);
     } catch (e) {
       console.error('[tracker] detectForVideo failed', e);
+      stats.error = String((e && e.message) || e).slice(0, 80);
       if (delegate === 'GPU') fallbackToCpu();
       return null;
     }
+    stats.calls++;
+    stats.ms = 0.8 * stats.ms + 0.2 * (performance.now() - t0);
 
     const lm = res && res.landmarks && res.landmarks[0];
     if (!lm || lm.length < 21) {
       return null;
     }
+    stats.hands++;
 
     const freshHand = ts - lastSeenMs > LOST_RESET_MS;
     if (freshHand) resetState();
@@ -407,6 +415,14 @@ export async function createTracker(opts = {}) {
   return {
     detect,
     close,
+    stats,
+    /** Switch to the CPU engine (some phones' GPU path silently finds no hands). */
+    useCpu(reason) {
+      fallbackToCpu(reason || 'requested');
+    },
+    get switching() {
+      return switching;
+    },
     get delegate() {
       return delegate;
     },
