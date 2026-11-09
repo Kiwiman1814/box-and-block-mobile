@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#0f1720">
+<title>Hand Rehab v2</title>
+<link rel="stylesheet" href="style.css">
+<script type="module" src="game.js"></script>
+</head>
+<body>
+<!-- Game canvas: camera picture ("cover" fit) + skeleton + game objects -->
+<canvas id="game"></canvas>
+<video id="video" playsinline muted autoplay></video>
+
+<!-- In-game HUD -->
+<div id="hud" hidden>
+  <div class="pill" id="hudA"></div>
+  <div class="pill" id="hudB"></div>
+  <button class="small secondary" id="btnQuit">Quit</button>
+</div>
+<div id="big" aria-live="polite"></div>
+
+<!-- Level 2, touch test mode only: choose a gesture -->
+<div id="rps" hidden>
+  <button class="secondary" data-g="fist">&#x270A;<span>Rock</span></button>
+  <button class="secondary" data-g="open">&#x270B;<span>Paper</span></button>
+  <button class="secondary" data-g="scissors">&#x270C;&#xFE0F;<span>Scissors</span></button>
+</div>
+
+<section class="screen" id="scrStart">
+  <div class="card">
+    <h1>Hand Rehab v2</h1>
+    <p>No markers needed &ndash; just show your bare hand to the camera.</p>
+    <button id="btnCam">Start with camera</button>
+    <div class="row">
+      <button class="secondary" id="btnFlip">Camera: front</button>
+      <button class="secondary" id="btnTouch">Touch test mode</button>
+    </div>
+    <p id="status" class="status" aria-live="polite"></p>
+    <p id="startErr" class="err" role="alert"></p>
+    <a class="v1" href="../">v1 (colour markers)</a>
+  </div>
+</section>
+
+<section class="screen see-through" id="scrMenu" hidden>
+  <div class="card">
+    <h1>Choose a level</h1>
+    <p id="modeLine"></p>
+    <button class="level" data-level="1"><b>1 &middot; Open &amp; close</b><small>10 open-close reps, then hold a fist 3 &times; 3 s</small><small class="best" id="best1"></small></button>
+    <button class="level" data-level="2"><b>2 &middot; Rock, paper, scissors</b><small>3 rounds against the computer</small><small class="best" id="best2"></small></button>
+    <button class="level" data-level="3"><b>3 &middot; Box and Block</b><small>Lift cubes over the wall in 60 s</small><small class="best" id="best3"></small></button>
+    <button class="secondary" id="btnHome">Home</button>
+  </div>
+</section>
+
+<section class="screen see-through" id="scrResults" hidden>
+  <div class="card">
+    <h1 id="resTitle"></h1>
+    <p id="resText"></p>
+    <p id="resBest" class="best"></p>
+    <div class="row">
+      <button id="btnAgain">Again</button>
+      <button class="secondary" id="btnMenu">Menu</button>
+    </div>
+  </div>
+</section>
+</body>
+</html>
