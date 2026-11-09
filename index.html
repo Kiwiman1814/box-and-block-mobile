@@ -90,9 +90,13 @@
 // Works on a small copy of the camera frame (PROC_W wide) for speed.
 // ---------------------------------------------------------------------------
 const PROC_W = 320;
-const GREEN = { hMin: 80, hMax: 180, sMin: 0.04, sMax: 0.80, vMin: 70 };
+// Phone cameras boost colour a lot, so any saturation counts as "green" here;
+// plants etc. are still rejected by the roundness + dark-ring tests.
+const GREEN = { hMin: 75, hMax: 175, sMin: 0.12, sMax: 1.0, vMin: 45 };
 const BLUE  = { hMin: 190, hMax: 300, sMin: 0.15, vMin: 45 };
-const RING_IN = 1.15, RING_OUT = 1.6, RING_CONTRAST = 0.30;
+const RING_IN = 1.15, RING_OUT = 1.6, RING_CONTRAST = 0.25;
+const PALM_MIN_FILL = 0.45, PALM_MAX_ASPECT = 2.0;
+let palmCands = [];          // for the Debug view: why each green blob was kept / rejected
 const TIP_MAX_D = 10;       // fingertips within this many palm diameters
 const TIP_MAX_ANGLE = 100;  // deg from straight up
 
@@ -195,10 +199,15 @@ function track(mirror) {
 
   // palm
   let palm = null, best = 0;
-  for (const bl of findBlobs(gmask, area * 0.0004, area * 0.04)) {
-    if (bl.fill < 0.5 || bl.aspect > 1.9) continue;
+  palmCands = [];
+  for (const bl of findBlobs(gmask, area * 0.0003, area * 0.08)) {
+    if (bl.area < 25) continue;
     const c = ringContrast(bl);
-    if (c < RING_CONTRAST) continue;
+    bl.contrast = c;
+    bl.why = bl.fill < PALM_MIN_FILL || bl.aspect > PALM_MAX_ASPECT ? "shape"
+           : c < RING_CONTRAST ? "ring " + c.toFixed(2) : "";
+    palmCands.push(bl);
+    if (bl.why) continue;
     let score = bl.fill * c;
     if (prevPalm) score /= 1 + 0.3 * Math.hypot(bl.cx - prevPalm.cx, bl.cy - prevPalm.cy) / (2 * prevPalm.r);
     if (score > best) { best = score; palm = bl; }
@@ -235,16 +244,50 @@ function spread(res) {
   return median(res.tips.map(t => Math.hypot(t.cx - res.palm.cx, t.cy - res.palm.cy) / D));
 }
 
+// Where the palm was last seen (camera coords) - used to keep following the
+// hand when a fist covers the green dot.
+const lost = { palm: null, at: 0, offX: 0, offY: 0, anchored: false };
+const FIST_HOLD_MS = 1500;   // covered dot + no caps seen near it for this long = hand gone
+
+function tipsNear(res, cx, cy, D) {
+  return res.tips.filter(t => Math.hypot(t.cx - cx, t.cy - cy) <= 4 * D);
+}
+
+function setHandPos(px, py, res) {
+  const p = camToScreen(px / res.w, py / res.h);
+  const tx = p.x / W, ty = p.y / H;
+  hand.x += (Math.min(1, Math.max(0, tx)) - hand.x) * 0.5;
+  hand.y += (Math.min(1, Math.max(0, ty)) - hand.y) * 0.5;
+}
+
 function updateHand(res, now) {
-  if (!res || !res.palm) {
+  if (!res) return;
+  if (!res.palm) {
+    // Dot not visible. If we saw it a moment ago, the fingers are most likely
+    // curled over it: that's a fist. Follow the hand with the blue caps that
+    // are still visible near it (usually thumb + knuckles).
+    if (lost.palm && now - lost.at < FIST_HOLD_MS) {
+      const D = 2 * lost.palm.r;
+      const near = tipsNear(res, lost.palm.cx, lost.palm.cy, D);
+      if (near.length) {
+        const mx = near.reduce((s, t) => s + t.cx, 0) / near.length;
+        const my = near.reduce((s, t) => s + t.cy, 0) / near.length;
+        if (!lost.anchored) { lost.offX = lost.palm.cx - mx; lost.offY = lost.palm.cy - my; lost.anchored = true; }
+        const px = mx + lost.offX, py = my + lost.offY;
+        setHandPos(px, py, res);
+        lost.palm = { cx: px, cy: py, r: lost.palm.r }; lost.at = now;
+      }
+      hand.seen = true; hand.lastSeen = now; hand.fistByCover = true;
+      hand.closure += (1 - hand.closure) * 0.4;
+      if (hand.closure > 0.6) hand.grabbing = true;
+      return;
+    }
     if (now - hand.lastSeen > 600) hand.seen = false;
     return;
   }
-  hand.seen = true; hand.lastSeen = now;
-  const nx = res.palm.cx / res.w, ny = res.palm.cy / res.h;
-  // map the middle 80% of the camera view to the whole screen
-  const tx = Math.min(1, Math.max(0, (nx - 0.1) / 0.8)), ty = Math.min(1, Math.max(0, (ny - 0.1) / 0.8));
-  hand.x += (tx - hand.x) * 0.5; hand.y += (ty - hand.y) * 0.5;
+  hand.seen = true; hand.lastSeen = now; hand.fistByCover = false;
+  lost.palm = { cx: res.palm.cx, cy: res.palm.cy, r: res.palm.r }; lost.at = now; lost.anchored = false;
+  setHandPos(res.palm.cx, res.palm.cy, res);
   let c;
   const s = spread(res);
   if (res.tips.length <= 1) c = 1;                       // fingers curled out of sight
@@ -341,11 +384,54 @@ function endRound() {
 let flashText = "", flashUntil = 0;
 function flash(t) { flashText = t; flashUntil = performance.now() + 900; }
 
+// Camera picture fills the screen ("cover"), so screen position = where the
+// hand really is in the picture.
+function coverRect() {
+  const vw = video.videoWidth, vh = video.videoHeight;
+  if (!vw || !vh) return { x: 0, y: 0, w: W, h: H };
+  const s = Math.max(W / vw, H / vh);
+  return { x: (W - vw * s) / 2, y: (H - vh * s) / 2, w: vw * s, h: vh * s };
+}
+function camToScreen(nx, ny) {
+  const r = coverRect();
+  return { x: r.x + nx * r.w, y: r.y + ny * r.h };
+}
+
 function drawGame(now) {
   const L = layout();
   g.fillStyle = "#0f1720"; g.fillRect(0, 0, W, H);
-  g.fillStyle = "#1b2836"; g.fillRect(0, L.floor, W, H - L.floor);
-  g.fillStyle = "rgba(63,182,139,0.10)"; g.fillRect(L.wallX, 0, W - L.wallX, L.floor);
+  if (useCamera && stream && video.readyState >= 2 && mode !== "start") {
+    const r = coverRect();
+    g.save();
+    if (facing === "user") { g.translate(W, 0); g.scale(-1, 1); g.drawImage(video, W - r.x - r.w, r.y, r.w, r.h); }
+    else g.drawImage(video, r.x, r.y, r.w, r.h);
+    g.restore();
+    g.fillStyle = "rgba(15,23,32,0.45)"; g.fillRect(0, 0, W, H);   // dim so the cubes stand out
+    if (lastRes) {   // markers the tracker sees, drawn on the picture
+      const sx = r.w / lastRes.w, sy = r.h / lastRes.h;
+      g.lineWidth = 2;
+      g.strokeStyle = "#4a7cff";
+      for (const t of lastRes.tips) { g.beginPath(); g.arc(r.x + t.cx * sx, r.y + t.cy * sy, (t.r + 3) * sx, 0, 7); g.stroke(); }
+      if (lastRes.palm) {
+        g.strokeStyle = "#3fd16b"; g.lineWidth = 3;
+        g.beginPath(); g.arc(r.x + lastRes.palm.cx * sx, r.y + lastRes.palm.cy * sy, (lastRes.palm.r + 4) * sx, 0, 7); g.stroke();
+      }
+      if (debug) {
+        g.font = "600 12px system-ui"; g.textAlign = "left";
+        for (const b of palmCands) {
+          const x = r.x + b.cx * sx, y = r.y + b.cy * sy;
+          g.strokeStyle = b.why ? "#ffb347" : "#3fd16b"; g.lineWidth = 1;
+          g.strokeRect(x - b.bw * sx / 2, y - b.bh * sy / 2, b.bw * sx, b.bh * sy);
+          g.fillStyle = "#fff";
+          g.fillText(b.why || "palm", x + b.bw * sx / 2 + 4, y);
+        }
+      }
+    }
+  } else {
+    g.fillStyle = "#1b2836"; g.fillRect(0, L.floor, W, H - L.floor);
+  }
+  g.fillStyle = "rgba(63,182,139,0.14)"; g.fillRect(L.wallX, 0, W - L.wallX, L.floor);
+  g.fillStyle = "rgba(27,40,54,0.85)"; g.fillRect(0, L.floor, W, 3);
   g.fillStyle = "#5b6b7c"; g.fillRect(L.wallX - L.wallW / 2, L.wallTop, L.wallW, L.floor - L.wallTop);
   g.fillStyle = "#93a4b5"; g.font = "600 14px system-ui"; g.textAlign = "center";
   g.fillText("pick up", L.wallX / 2, L.floor + 24); g.fillText("drop here", L.wallX * 1.5, L.floor + 24);
@@ -405,7 +491,10 @@ function stepCalib(res, now) {
     }
   } else {
     big.textContent = el < 1500 ? "Now make a fist" : `Hold the fist… ${Math.ceil((4500 - el) / 1000)}`;
-    if (el > 1500 && res && res.palm) st.fist.push(s == null ? 0.4 * median(st.open.slice()) : s);
+    if (el > 1500 && res) {
+      if (res.palm) st.fist.push(s == null ? 0.4 * median(st.open.slice()) : s);
+      else if (hand.fistByCover) st.fist.push(0.3 * median(st.open.slice()));   // dot covered by the fist
+    }
     if (el > 4500) {
       const open = median(st.open.slice()), fist = st.fist.length ? median(st.fist.slice()) : open * 0.5;
       calib = { open, fist: Math.min(fist, open * 0.85) }; saveCalib(calib);
@@ -425,7 +514,7 @@ function frame(now) {
   if (mode === "calib") stepCalib(lastRes, now);
   if (mode === "play") stepGame(now, dt);
   drawGame(now);
-  drawCam(mode === "start" ? null : lastRes);
+  drawCam(mode === "start" || !debug ? null : lastRes);   // small mask view only in Debug
   requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);
