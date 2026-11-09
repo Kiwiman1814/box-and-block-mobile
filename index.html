@@ -1,0 +1,488 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#0f1720">
+<title>Nomad Fjord Mobile</title>
+<style>
+  :root {
+    --bg: #0f1720; --panel: #17222e; --text: #e8eef4; --muted: #93a4b5;
+    --accent: #3fb68b; --accent-2: #4a7cff; --warn: #ffb347; --bad: #ff6b6b;
+    --cube: #f2a541; --wall: #5b6b7c;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  [hidden] { display: none !important; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font: 16px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; overflow: hidden;
+    touch-action: none; user-select: none; -webkit-user-select: none; }
+  #game { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; }
+  #cam { position: fixed; right: 10px; top: calc(10px + env(safe-area-inset-top)); width: 30vw; max-width: 220px;
+    border-radius: 10px; border: 2px solid #2a3a4a; background: #000; z-index: 2; }
+  video { position: fixed; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+  .screen { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center;
+    justify-content: center; gap: 14px; padding: 24px 16px; text-align: center; z-index: 5;
+    background: rgba(15, 23, 32, 0.94); }
+  .screen[hidden] { display: none; }
+  h1 { margin: 0; font-size: 26px; }
+  p { margin: 0; color: var(--muted); max-width: 440px; }
+  button { font: inherit; font-weight: 600; color: var(--text); background: var(--accent); border: 0;
+    border-radius: 12px; padding: 14px 22px; min-width: 240px; cursor: pointer; }
+  button.secondary { background: #2a3a4a; }
+  button.small { min-width: 0; padding: 8px 12px; font-size: 14px; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; }
+  #hud { position: fixed; left: 10px; top: calc(10px + env(safe-area-inset-top)); z-index: 3;
+    display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }
+  #hud .pill { background: rgba(23, 34, 46, 0.85); border-radius: 999px; padding: 6px 12px; font-weight: 600; }
+  #big { position: fixed; left: 0; right: 0; bottom: calc(18px + env(safe-area-inset-bottom)); text-align: center;
+    z-index: 3; font-size: 20px; font-weight: 700; text-shadow: 0 2px 6px #000; pointer-events: none; }
+  .err { color: var(--bad); }
+  .legend { display: grid; grid-template-columns: auto 1fr; gap: 6px 10px; text-align: left; color: var(--muted);
+    max-width: 440px; font-size: 14px; }
+  .dot { width: 14px; height: 14px; border-radius: 50%; display: inline-block; margin-top: 3px; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<canvas id="cam" hidden></canvas>
+<video id="video" playsinline muted autoplay></video>
+
+<div id="hud" hidden>
+  <div class="pill" id="score">Score 0</div>
+  <div class="pill" id="timer">60</div>
+  <div class="row" style="justify-content:flex-start">
+    <button class="small secondary" id="btnDebug">Debug</button>
+    <button class="small secondary" id="btnQuit">Quit</button>
+  </div>
+</div>
+<div id="big"></div>
+
+<div class="screen" id="scrStart">
+  <h1>Box and Block</h1>
+  <p>Grab cubes with your hand, lift them over the wall and open your hand to drop them on the other side.</p>
+  <div class="legend">
+    <span class="dot" style="background:#7bd67b"></span><span>Green dot in the middle of your palm, with a wide black ring around it</span>
+    <span class="dot" style="background:#5a5ae0"></span><span>Blue or purple on all five fingertips</span>
+    <span class="dot" style="background:#ccc"></span><span>Palm facing the camera, even light, no blue or green behind you</span>
+  </div>
+  <button id="btnCam">Start with camera</button>
+  <div class="row">
+    <button class="secondary" id="btnFlip" style="min-width:0">Camera: front</button>
+    <button class="secondary" id="btnTouch" style="min-width:0">Touch test mode</button>
+  </div>
+  <p id="startErr" class="err"></p>
+</div>
+
+<div class="screen" id="scrEnd" hidden>
+  <h1 id="endTitle">Time!</h1>
+  <p id="endText"></p>
+  <button id="btnAgain">Play again</button>
+  <button class="secondary" id="btnRecal">Recalibrate</button>
+  <button class="secondary" id="btnHome">Home</button>
+</div>
+
+<script>
+"use strict";
+// ---------------------------------------------------------------------------
+// Marker tracker (browser port of hand_tracker/robot_hand_tracker.py, simplified)
+//   palm  : green dot, round, inside a darker ring (1.15-1.6 x its radius)
+//   tips  : blue/purple blobs near the palm and above it, up to 5
+// Works on a small copy of the camera frame (PROC_W wide) for speed.
+// ---------------------------------------------------------------------------
+const PROC_W = 320;
+const GREEN = { hMin: 80, hMax: 180, sMin: 0.04, sMax: 0.80, vMin: 70 };
+const BLUE  = { hMin: 190, hMax: 300, sMin: 0.15, vMin: 45 };
+const RING_IN = 1.15, RING_OUT = 1.6, RING_CONTRAST = 0.30;
+const TIP_MAX_D = 10;       // fingertips within this many palm diameters
+const TIP_MAX_ANGLE = 100;  // deg from straight up
+
+const video = document.getElementById("video");
+const proc = document.createElement("canvas");
+const pctx = proc.getContext("2d", { willReadFrequently: true });
+let PW = PROC_W, PH = 240;
+let gmask, bmask, vval, labels;
+
+function allocBuffers(w, h) {
+  PW = w; PH = h; proc.width = w; proc.height = h;
+  gmask = new Uint8Array(w * h); bmask = new Uint8Array(w * h);
+  vval = new Uint8Array(w * h); labels = new Int32Array(w * h);
+}
+
+function classify(data) {
+  const n = PW * PH;
+  for (let i = 0, j = 0; i < n; i++, j += 4) {
+    const r = data[j], g = data[j + 1], b = data[j + 2];
+    const mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
+    const mn = r < g ? (r < b ? r : b) : (g < b ? g : b);
+    vval[i] = mx;
+    const d = mx - mn;
+    gmask[i] = 0; bmask[i] = 0;
+    if (mx === 0 || d === 0) continue;
+    const s = d / mx;
+    let h;
+    if (mx === r) h = 60 * (((g - b) / d) % 6);
+    else if (mx === g) h = 60 * ((b - r) / d + 2);
+    else h = 60 * ((r - g) / d + 4);
+    if (h < 0) h += 360;
+    if (h >= GREEN.hMin && h <= GREEN.hMax && s >= GREEN.sMin && s <= GREEN.sMax && mx >= GREEN.vMin) gmask[i] = 1;
+    else if (h >= BLUE.hMin && h <= BLUE.hMax && s >= BLUE.sMin && mx >= BLUE.vMin) bmask[i] = 1;
+  }
+}
+
+// Connected components (4-neighbour flood fill) -> blobs with area, centre, bbox
+function findBlobs(mask, minArea, maxArea) {
+  labels.fill(0);
+  const out = [], stack = [];
+  let next = 1;
+  for (let start = 0; start < mask.length; start++) {
+    if (!mask[start] || labels[start]) continue;
+    const id = next++;
+    labels[start] = id; stack.push(start);
+    let area = 0, sx = 0, sy = 0, x0 = PW, y0 = PH, x1 = 0, y1 = 0;
+    while (stack.length) {
+      const p = stack.pop();
+      const x = p % PW, y = (p - x) / PW;
+      area++; sx += x; sy += y;
+      if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+      if (x > 0 && mask[p - 1] && !labels[p - 1]) { labels[p - 1] = id; stack.push(p - 1); }
+      if (x < PW - 1 && mask[p + 1] && !labels[p + 1]) { labels[p + 1] = id; stack.push(p + 1); }
+      if (y > 0 && mask[p - PW] && !labels[p - PW]) { labels[p - PW] = id; stack.push(p - PW); }
+      if (y < PH - 1 && mask[p + PW] && !labels[p + PW]) { labels[p + PW] = id; stack.push(p + PW); }
+    }
+    if (area < minArea || area > maxArea) continue;
+    const bw = x1 - x0 + 1, bh = y1 - y0 + 1;
+    out.push({ id, area, cx: sx / area, cy: sy / area, bw, bh,
+      fill: area / (bw * bh), aspect: Math.max(bw, bh) / Math.min(bw, bh),
+      r: Math.sqrt(area / Math.PI) });
+  }
+  return out;
+}
+
+function median(arr) {
+  if (!arr.length) return 0;
+  arr.sort((a, b) => a - b);
+  const m = arr.length >> 1;
+  return arr.length % 2 ? arr[m] : (arr[m - 1] + arr[m]) / 2;
+}
+
+function ringContrast(bl) {
+  const inner = [], ring = [];
+  const R = bl.r * RING_OUT, Ri = bl.r * RING_IN;
+  const x0 = Math.max(0, Math.floor(bl.cx - R)), x1 = Math.min(PW - 1, Math.ceil(bl.cx + R));
+  const y0 = Math.max(0, Math.floor(bl.cy - R)), y1 = Math.min(PH - 1, Math.ceil(bl.cy + R));
+  for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+    const p = y * PW + x, d = Math.hypot(x - bl.cx, y - bl.cy);
+    if (labels[p] === bl.id) inner.push(vval[p]);
+    else if (d >= Ri && d <= R) ring.push(vval[p]);
+  }
+  if (!inner.length || !ring.length) return 0;
+  return Math.max(0, 1 - median(ring) / Math.max(median(inner), 1));
+}
+
+let prevPalm = null;
+function track(mirror) {
+  const vw = video.videoWidth, vh = video.videoHeight;
+  if (!vw || !vh) return null;
+  const h = Math.round(PROC_W * vh / vw);
+  if (PW !== PROC_W || PH !== h || !gmask) allocBuffers(PROC_W, h);
+  pctx.save();
+  if (mirror) { pctx.translate(PW, 0); pctx.scale(-1, 1); }
+  pctx.drawImage(video, 0, 0, PW, PH);
+  pctx.restore();
+  const img = pctx.getImageData(0, 0, PW, PH);
+  classify(img.data);
+  const area = PW * PH;
+
+  // palm
+  let palm = null, best = 0;
+  for (const bl of findBlobs(gmask, area * 0.0004, area * 0.04)) {
+    if (bl.fill < 0.5 || bl.aspect > 1.9) continue;
+    const c = ringContrast(bl);
+    if (c < RING_CONTRAST) continue;
+    let score = bl.fill * c;
+    if (prevPalm) score /= 1 + 0.3 * Math.hypot(bl.cx - prevPalm.cx, bl.cy - prevPalm.cy) / (2 * prevPalm.r);
+    if (score > best) { best = score; palm = bl; }
+  }
+  if (palm) prevPalm = palm;
+
+  // fingertips
+  let tips = findBlobs(bmask, area * 0.00008, area * 0.03).filter(b => b.fill >= 0.3 && b.aspect <= 2.8);
+  if (palm) {
+    const D = 2 * palm.r;
+    tips = tips.filter(t => {
+      const dist = Math.hypot(t.cx - palm.cx, t.cy - palm.cy) / D;
+      const ang = Math.abs(Math.atan2(t.cx - palm.cx, palm.cy - t.cy) * 180 / Math.PI);
+      return dist <= TIP_MAX_D && ang <= TIP_MAX_ANGLE;
+    });
+  }
+  tips.sort((a, b) => b.area - a.area);
+  tips = tips.slice(0, 5);
+  return { img, palm, tips, w: PW, h: PH };
+}
+
+// ---------------------------------------------------------------------------
+// Hand state: position (0..1) + closed/open from fingertip distance
+// ---------------------------------------------------------------------------
+const hand = { x: 0.5, y: 0.5, seen: false, closure: 0, grabbing: false, lastSeen: 0 };
+let calib = loadCalib();
+function loadCalib() { try { return JSON.parse(localStorage.getItem("nf_calib")) || null; } catch { return null; } }
+function saveCalib(c) { try { localStorage.setItem("nf_calib", JSON.stringify(c)); } catch {} }
+
+function spread(res) {
+  // median fingertip distance in palm diameters (null if not enough tips)
+  if (!res.palm || res.tips.length < 2) return null;
+  const D = 2 * res.palm.r;
+  return median(res.tips.map(t => Math.hypot(t.cx - res.palm.cx, t.cy - res.palm.cy) / D));
+}
+
+function updateHand(res, now) {
+  if (!res || !res.palm) {
+    if (now - hand.lastSeen > 600) hand.seen = false;
+    return;
+  }
+  hand.seen = true; hand.lastSeen = now;
+  const nx = res.palm.cx / res.w, ny = res.palm.cy / res.h;
+  // map the middle 80% of the camera view to the whole screen
+  const tx = Math.min(1, Math.max(0, (nx - 0.1) / 0.8)), ty = Math.min(1, Math.max(0, (ny - 0.1) / 0.8));
+  hand.x += (tx - hand.x) * 0.5; hand.y += (ty - hand.y) * 0.5;
+  let c;
+  const s = spread(res);
+  if (res.tips.length <= 1) c = 1;                       // fingers curled out of sight
+  else if (s == null || !calib) c = res.tips.length >= 4 ? 0 : 1;
+  else c = Math.min(1, Math.max(0, (calib.open - s) / Math.max(calib.open - calib.fist, 0.3)));
+  hand.closure += (c - hand.closure) * 0.4;
+  if (!hand.grabbing && hand.closure > 0.6) hand.grabbing = true;
+  else if (hand.grabbing && hand.closure < 0.4) hand.grabbing = false;
+}
+
+// ---------------------------------------------------------------------------
+// Game
+// ---------------------------------------------------------------------------
+const cv = document.getElementById("game"), g = cv.getContext("2d");
+const camCv = document.getElementById("cam"), cctx = camCv.getContext("2d");
+const $ = id => document.getElementById(id);
+let W = 0, H = 0, DPR = 1;
+function resize() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = window.innerWidth; H = window.innerHeight;
+  cv.width = W * DPR; cv.height = H * DPR; g.setTransform(DPR, 0, 0, DPR, 0, 0);
+}
+window.addEventListener("resize", resize); resize();
+
+let mode = "start";           // start | calib | play | end
+let useCamera = true, facing = "user", debug = false, stream = null;
+let cubes = [], held = null, score = 0, wallHits = 0, endAt = 0, calibStep = null;
+const ROUND_MS = 60000;
+
+function layout() {
+  const floor = H * 0.86, wallX = W / 2, wallW = Math.max(14, W * 0.025);
+  return { floor, wallX, wallW, wallTop: floor - H * 0.38, cube: Math.max(34, Math.min(W, H) * 0.08) };
+}
+function spawnCube() {
+  const L = layout();
+  cubes.push({ x: L.wallX * (0.2 + Math.random() * 0.55), y: L.floor - L.cube / 2, vy: 0, side: "L" });
+}
+function startRound() {
+  cubes = []; held = null; score = 0; wallHits = 0;
+  for (let i = 0; i < 4; i++) spawnCube();
+  endAt = performance.now() + ROUND_MS; mode = "play";
+  $("hud").hidden = false; show(null);
+}
+
+function cursor() { return { x: hand.x * W, y: hand.y * H }; }
+
+function stepGame(now, dt) {
+  const L = layout(), c = cursor();
+  if (held) {
+    const prevX = held.x;
+    held.x = c.x; held.y = Math.min(c.y, L.floor - L.cube / 2);
+    // crossing the wall below its top knocks the cube out of the hand
+    const crossed = (prevX - L.wallX) * (held.x - L.wallX) < 0;
+    if (crossed && held.y + L.cube / 2 > L.wallTop) {
+      held.x = prevX; wallHits++; flash("Hit the wall - lift higher!");
+      held.vy = 0; held = null;
+    } else if (!hand.grabbing || !hand.seen) {
+      held.vy = 0; held = null;               // dropped
+    }
+  } else if (hand.grabbing && hand.seen) {
+    // grab the nearest cube under the hand
+    let best = null, bd = L.cube * 1.1;
+    for (const cb of cubes) {
+      if (cb.side !== "L") continue;
+      const d = Math.hypot(cb.x - c.x, cb.y - c.y);
+      if (d < bd) { bd = d; best = cb; }
+    }
+    if (best && !hand.wasGrabbing) held = best;
+  }
+  hand.wasGrabbing = hand.grabbing;
+  for (const cb of cubes) {
+    if (cb === held) continue;
+    const ground = L.floor - L.cube / 2;
+    if (cb.y < ground) { cb.vy += 2400 * dt; cb.y = Math.min(ground, cb.y + cb.vy * dt); }
+    if (cb.y >= ground && cb.side === "L" && cb.x > L.wallX) {
+      cb.side = "R"; score++; flash("+1"); spawnCube();
+    }
+    // a cube resting against the wall on the left stays on the left
+    if (cb.side === "L" && cb.x < L.wallX) cb.x = Math.min(cb.x, L.wallX - L.wallW / 2 - L.cube / 2);
+  }
+  const right = cubes.filter(cb => cb.side === "R");
+  if (right.length > 12) cubes.splice(cubes.indexOf(right[0]), 1);
+  if (now >= endAt) endRound();
+}
+
+function endRound() {
+  mode = "end"; held = null; $("hud").hidden = true;
+  $("endTitle").textContent = "Time!";
+  $("endText").textContent = `You moved ${score} cube${score === 1 ? "" : "s"} over the wall` +
+    (wallHits ? ` (${wallHits} wall hit${wallHits === 1 ? "" : "s"}).` : ".");
+  show("scrEnd");
+}
+
+let flashText = "", flashUntil = 0;
+function flash(t) { flashText = t; flashUntil = performance.now() + 900; }
+
+function drawGame(now) {
+  const L = layout();
+  g.fillStyle = "#0f1720"; g.fillRect(0, 0, W, H);
+  g.fillStyle = "#1b2836"; g.fillRect(0, L.floor, W, H - L.floor);
+  g.fillStyle = "rgba(63,182,139,0.10)"; g.fillRect(L.wallX, 0, W - L.wallX, L.floor);
+  g.fillStyle = "#5b6b7c"; g.fillRect(L.wallX - L.wallW / 2, L.wallTop, L.wallW, L.floor - L.wallTop);
+  g.fillStyle = "#93a4b5"; g.font = "600 14px system-ui"; g.textAlign = "center";
+  g.fillText("pick up", L.wallX / 2, L.floor + 24); g.fillText("drop here", L.wallX * 1.5, L.floor + 24);
+  for (const cb of cubes) {
+    const s = L.cube;
+    g.fillStyle = cb.side === "R" ? "#3fb68b" : "#f2a541";
+    g.fillRect(cb.x - s / 2, cb.y - s / 2, s, s);
+    g.strokeStyle = "rgba(0,0,0,0.35)"; g.lineWidth = 2; g.strokeRect(cb.x - s / 2, cb.y - s / 2, s, s);
+  }
+  if (mode === "play" || mode === "calib") {
+    const c = cursor(), r = L.cube * 0.7;
+    g.globalAlpha = hand.seen ? 1 : 0.35;
+    g.lineWidth = 4; g.strokeStyle = hand.grabbing ? "#ffb347" : "#e8eef4";
+    g.beginPath(); g.arc(c.x, c.y, r * (1 - 0.35 * hand.closure), 0, Math.PI * 2); g.stroke();
+    g.globalAlpha = 1;
+  }
+  const big = $("big");
+  if (mode === "play") {
+    $("score").textContent = `Score ${score}`;
+    $("timer").textContent = `${Math.max(0, Math.ceil((endAt - now) / 1000))} s`;
+    big.textContent = now < flashUntil ? flashText : (!hand.seen && useCamera ? "Show your palm to the camera" : "");
+  } else if (mode !== "calib") big.textContent = "";
+}
+
+function drawCam(res) {
+  if (!res || !useCamera) { camCv.hidden = true; return; }
+  camCv.hidden = false;
+  if (camCv.width !== res.w) { camCv.width = res.w; camCv.height = res.h; }
+  if (debug) {
+    const d = res.img.data;
+    for (let i = 0, j = 0; i < res.w * res.h; i++, j += 4) {
+      if (gmask[i]) { d[j] = 0; d[j + 1] = 255; d[j + 2] = 0; }
+      else if (bmask[i]) { d[j] = 60; d[j + 1] = 90; d[j + 2] = 255; }
+      else { const v = vval[i] * 0.35; d[j] = d[j + 1] = d[j + 2] = v; }
+    }
+  }
+  cctx.putImageData(res.img, 0, 0);
+  cctx.lineWidth = 2;
+  for (const t of res.tips) { cctx.strokeStyle = "#4a7cff"; cctx.beginPath(); cctx.arc(t.cx, t.cy, t.r + 3, 0, 7); cctx.stroke(); }
+  if (res.palm) { cctx.strokeStyle = "#3fd16b"; cctx.beginPath(); cctx.arc(res.palm.cx, res.palm.cy, res.palm.r + 3, 0, 7); cctx.stroke(); }
+}
+
+// --- calibration: open hand, then fist (3 s each, after a short get-ready) ---
+function startCalib() {
+  mode = "calib"; $("hud").hidden = true; show(null);
+  calibStep = { phase: "open", t0: performance.now(), open: [], fist: [] };
+}
+function stepCalib(res, now) {
+  const big = $("big"), st = calibStep, el = now - st.t0;
+  const s = res ? spread(res) : null;
+  if (st.phase === "open") {
+    big.textContent = el < 1500 ? "Open your hand, palm to camera" : `Hold it open… ${Math.ceil((4500 - el) / 1000)}`;
+    if (el > 1500 && s != null && res.tips.length >= 4) st.open.push(s);
+    if (el > 4500) {
+      if (st.open.length < 5) { st.t0 = now; st.open = []; flash(""); big.textContent = "Can't see the markers - try again"; return; }
+      st.phase = "fist"; st.t0 = now;
+    }
+  } else {
+    big.textContent = el < 1500 ? "Now make a fist" : `Hold the fist… ${Math.ceil((4500 - el) / 1000)}`;
+    if (el > 1500 && res && res.palm) st.fist.push(s == null ? 0.4 * median(st.open.slice()) : s);
+    if (el > 4500) {
+      const open = median(st.open.slice()), fist = st.fist.length ? median(st.fist.slice()) : open * 0.5;
+      calib = { open, fist: Math.min(fist, open * 0.85) }; saveCalib(calib);
+      big.textContent = ""; startRound();
+    }
+  }
+}
+
+// --- main loop ---
+let last = performance.now(), lastRes = null;
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000); last = now;
+  if (useCamera && stream && video.readyState >= 2 && mode !== "start") {
+    lastRes = track(facing === "user");
+    updateHand(lastRes, now);
+  }
+  if (mode === "calib") stepCalib(lastRes, now);
+  if (mode === "play") stepGame(now, dt);
+  drawGame(now);
+  drawCam(mode === "start" ? null : lastRes);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// --- camera ---
+async function openCamera() {
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia)
+    throw new Error("This browser can't use the camera here. Open the page over https in Safari or Chrome.");
+  stream = await navigator.mediaDevices.getUserMedia({
+    audio: false, video: { facingMode: facing, width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 30 } } });
+  video.srcObject = stream;
+  await video.play();
+}
+
+// --- touch test mode: finger position = hand, finger down = grab ---
+function pointer(e, down) {
+  if (useCamera) return;
+  const p = e.touches ? e.touches[0] : e;
+  if (p) { hand.x = p.clientX / W; hand.y = p.clientY / H; }
+  if (down !== undefined) { hand.grabbing = down; hand.closure = down ? 1 : 0; }
+  hand.seen = true;
+}
+cv.addEventListener("pointerdown", e => pointer(e, true));
+cv.addEventListener("pointermove", e => pointer(e));
+window.addEventListener("pointerup", e => pointer(e, false));
+
+function show(id) { for (const s of document.querySelectorAll(".screen")) s.hidden = s.id !== id; }
+
+$("btnCam").onclick = async () => {
+  $("startErr").textContent = "";
+  try {
+    useCamera = true; await openCamera();
+    if (calib) startRound(); else startCalib();
+  } catch (e) {
+    $("startErr").textContent = (e && e.name === "NotAllowedError")
+      ? "Camera permission was denied. Allow camera access for this site and try again."
+      : (e.message || String(e));
+  }
+};
+$("btnTouch").onclick = () => {
+  useCamera = false; if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+  hand.seen = true; startRound();
+};
+$("btnFlip").onclick = () => {
+  facing = facing === "user" ? "environment" : "user";
+  $("btnFlip").textContent = facing === "user" ? "Camera: front" : "Camera: back";
+};
+$("btnDebug").onclick = () => { debug = !debug; };
+$("btnQuit").onclick = () => endRound();
+$("btnAgain").onclick = () => useCamera ? startRound() : $("btnTouch").onclick();
+$("btnRecal").onclick = async () => {
+  calib = null;
+  if (!useCamera) { $("btnCam").onclick(); return; }
+  startCalib();
+};
+$("btnHome").onclick = () => { mode = "start"; show("scrStart"); };
+</script>
+</body>
+</html>
