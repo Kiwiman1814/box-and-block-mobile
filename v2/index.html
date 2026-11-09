@@ -33,6 +33,14 @@
     <h1>Hand Rehab v2</h1>
     <p>No markers needed &ndash; just show your bare hand to the camera.</p>
     <button id="btnCam">Start with camera</button>
+    <label class="engine">Hand tracking engine
+      <select id="engine">
+        <option value="auto">Auto (tries each until one sees your hand)</option>
+        <option value="mediapipe">MediaPipe</option>
+        <option value="tfjs">TensorFlow.js</option>
+        <option value="motion">Motion only (no hand model)</option>
+      </select>
+    </label>
     <div class="row">
       <button class="secondary" id="btnFlip">Camera: front</button>
       <button class="secondary" id="btnTouch">Touch test mode</button>
@@ -49,7 +57,7 @@
     <p id="modeLine"></p>
     <button class="level" data-level="1"><b>1 &middot; Open &amp; close</b><small>10 open-close reps, then hold a fist 3 &times; 3 s</small><small class="best" id="best1"></small></button>
     <button class="level" data-level="2"><b>2 &middot; Rock, paper, scissors</b><small>3 rounds against the computer</small><small class="best" id="best2"></small></button>
-    <button class="level" data-level="3"><b>3 &middot; Box and Block</b><small>Lift cubes over the wall in 60 s</small><small class="best" id="best3"></small></button>
+    <button class="level" data-level="3"><b>3 &middot; Box and Block</b><small>Pinch thumb + index to grab, lift over the wall, let go</small><small class="best" id="best3"></small></button>
     <button class="secondary" id="btnHome">Home</button>
   </div>
 </section>

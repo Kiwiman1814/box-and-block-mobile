@@ -17,7 +17,9 @@ const state = {
   mirror: false,            // draw/map mirrored (front camera)
   stream: null, tracker: null, trackerPromise: null, mock: null,
   res: null,                // last HandResult (or null)
-  hand: { seen: false, x: 0, y: 0, closure: 0, gesture: null, lastSeen: -1e9 },
+  hand: { seen: false, x: 0, y: 0, closure: 0, gesture: null, lastSeen: -1e9,
+          pinched: false, pinchDist: null, px: null, py: null, motion: false },
+  engine: null,             // "mediapipe" | "tfjs" | "motion" (engine in use)
   level: null, levelNo: 0,
   flash: { text: "", until: 0 },
   lastNow: 0, lastDetect: 0, lastVideoTime: -1, detectErr: null,
@@ -162,18 +164,75 @@ function cameraErrorText(e) {
 
 function setStatus(t) { $("status").textContent = t || ""; }
 
-async function loadTracker() {
-  if (state.tracker) return state.tracker;
-  if (!state.trackerPromise) {
-    state.trackerPromise = (async () => {
-      setStatus("Loading hand tracker…");
-      const mod = await import("./tracker.js");
-      return mod.createTracker({ onStatus: t => { if (state.screen === "start") setStatus(t); } });
+// ---------------------------------------------------------------------------
+// Engines: MediaPipe (tracker.js), TensorFlow.js (tracker-tfjs.js), Motion
+// (tracker-motion.js). Each is loaded only when first needed and cached.
+// "auto" starts with MediaPipe and moves down this chain while no hand is found.
+// ---------------------------------------------------------------------------
+const ENGINE_FILES = { mediapipe: "./tracker.js", tfjs: "./tracker-tfjs.js", motion: "./tracker-motion.js" };
+const ENGINE_NAMES = { mediapipe: "MediaPipe", tfjs: "TensorFlow.js", motion: "Motion" };
+const AUTO_CHAIN = ["mediapipe", "tfjs", "motion"];
+const engineCache = {};          // kind -> Promise<tracker>
+
+function engineChoice() { const s = $("engine"); return (s && s.value) || "auto"; }
+
+function getEngine(kind) {
+  if (!engineCache[kind]) {
+    engineCache[kind] = (async () => {
+      const mod = await import(ENGINE_FILES[kind]);
+      return mod.createTracker({ onStatus: t => {
+        if (state.screen === "start") setStatus(t); else if (t && !/ready/i.test(t)) flash(t, 1500);
+      } });
     })();
+    engineCache[kind].catch(() => { delete engineCache[kind]; });
   }
-  try { state.tracker = await state.trackerPromise; }
-  catch (e) { state.trackerPromise = null; throw e; }
-  return state.tracker;
+  return engineCache[kind];
+}
+
+async function loadTracker(kind) {
+  kind = kind || (engineChoice() === "auto" ? AUTO_CHAIN[0] : engineChoice());
+  setStatus(`Loading ${ENGINE_NAMES[kind]} hand tracker…`);
+  const trk = await getEngine(kind);
+  state.tracker = trk; state.engine = kind;
+  resetAutoWatch();
+  return trk;
+}
+
+// Switch to another engine while playing (status-line tap or auto fallback).
+let switchingEngine = false;
+async function switchEngine(kind, why) {
+  if (switchingEngine || kind === state.engine) return;
+  switchingEngine = true;
+  flash(`${why ? why + " – " : ""}trying ${ENGINE_NAMES[kind]}…`, 2500);
+  try { await loadTracker(kind); flash(`Using ${ENGINE_NAMES[kind]}`, 1500); }
+  catch (e) {
+    console.warn("engine failed", kind, e);
+    flash(`${ENGINE_NAMES[kind]} could not start`, 2000);
+    const next = AUTO_CHAIN[AUTO_CHAIN.indexOf(kind) + 1];
+    switchingEngine = false;
+    if (next && engineChoice() === "auto") return switchEngine(next, "");
+  }
+  switchingEngine = false;
+}
+
+// Auto mode: an engine that found no hand at all within ~7 s (while the camera
+// runs and frames are processed) is replaced by the next one in AUTO_CHAIN.
+const autoWatch = { since: 0, calls0: 0, hands0: 0, done: false };
+function resetAutoWatch() { autoWatch.since = 0; autoWatch.done = false; }
+function autoFallback(now) {
+  const trk = state.tracker;
+  if (!trk || switchingEngine || autoWatch.done || engineChoice() !== "auto") return;
+  if (trk.switching) { autoWatch.since = 0; return; }              // MediaPipe GPU->CPU in progress
+  const s = trk.stats || { calls: 0, hands: 0 };
+  if (!autoWatch.since) { autoWatch.since = now; autoWatch.calls0 = s.calls; autoWatch.hands0 = s.hands; return; }
+  if (s.hands > autoWatch.hands0) { autoWatch.done = true; return; }   // this engine works: keep it
+  // MediaPipe gets its own GPU->CPU attempt first (handled in updateDiag)
+  if (state.engine === "mediapipe" && trk.delegate === "GPU") return;
+  if (now - autoWatch.since > 7000 && s.calls - autoWatch.calls0 > 30) {
+    const next = AUTO_CHAIN[AUTO_CHAIN.indexOf(state.engine) + 1];
+    autoWatch.done = true;
+    if (next) switchEngine(next, `${ENGINE_NAMES[state.engine]} sees no hand`);
+  }
 }
 
 let starting = false;
@@ -183,7 +242,12 @@ async function startCamera() {
   const btn = $("btnCam"); btn.disabled = true;
   $("startErr").textContent = ""; setStatus("Starting camera…");
   const camP = openCamera();       // called first, inside the click gesture
-  const trkP = loadTracker();
+  const trkP = (async () => {       // auto: first engine that loads at all
+    if (engineChoice() !== "auto") return loadTracker(engineChoice());
+    let lastErr;
+    for (const k of AUTO_CHAIN) { try { return await loadTracker(k); } catch (e) { lastErr = e; console.warn(k, e); } }
+    throw lastErr;
+  })();
   trkP.catch(() => {});            // handled below; avoid unhandled-rejection noise
   try {
     try { await camP; }
@@ -219,7 +283,14 @@ diag.style.cssText = "position:fixed;left:8px;bottom:calc(6px + env(safe-area-in
   "font:600 11px/1.3 system-ui,sans-serif;color:#cfe;background:rgba(0,0,0,.55);padding:4px 8px;border-radius:8px;" +
   "max-width:calc(100vw - 16px);pointer-events:auto";
 diag.hidden = true;
-diag.addEventListener("click", () => { if (state.tracker && state.tracker.useCpu) state.tracker.useCpu("tapped"); });
+// Tap the status line: MediaPipe on GPU -> MediaPipe on CPU -> next engine -> … -> MediaPipe.
+diag.addEventListener("click", () => {
+  const trk = state.tracker;
+  if (!trk || switchingEngine) return;
+  if (state.engine === "mediapipe" && trk.delegate === "GPU" && trk.useCpu) { trk.useCpu("tapped"); return; }
+  const next = AUTO_CHAIN[(AUTO_CHAIN.indexOf(state.engine) + 1) % AUTO_CHAIN.length];
+  switchEngine(next, "");
+});
 document.body.appendChild(diag);
 const dstat = { t0: 0, calls0: 0, hands0: 0, rate: 0, found: 0, gpuSince: 0, gpuCalls0: 0 };
 
@@ -236,7 +307,7 @@ function updateDiag(now) {
   }
   // GPU engine that never finds a hand (known on some phones, esp. iPhone):
   // after ~6 s and 40+ frames with zero hands, switch to CPU automatically.
-  if (trk.delegate === "GPU" && !trk.switching) {
+  if (state.engine === "mediapipe" && trk.delegate === "GPU" && !trk.switching) {
     if (!dstat.gpuSince) { dstat.gpuSince = now; dstat.gpuCalls0 = s.calls; dstat.gpuHands0 = s.hands; }
     if (s.hands > dstat.gpuHands0) dstat.gpuSince = -1;             // GPU works: stop watching
     else if (dstat.gpuSince > 0 && now - dstat.gpuSince > 6000 && s.calls - dstat.gpuCalls0 > 40) {
@@ -244,10 +315,32 @@ function updateDiag(now) {
     }
   }
   const vs = video.videoWidth ? `${video.videoWidth}×${video.videoHeight}` : "no video";
-  diag.textContent = `${trk.switching ? "switching…" : trk.delegate} · ${dstat.rate.toFixed(0)} fps · ` +
-    `${s.ms.toFixed(0)} ms · hand ${Math.round(dstat.found * 100)}% · ${vs}` +
-    (s.error ? ` · err: ${s.error}` : "") + (trk.delegate === "GPU" ? " · tap = CPU" : "");
+  const h = state.hand;
+  const pinchTxt = h.pinchDist != null ? ` · pinch ${h.pinchDist.toFixed(2)}${h.pinched ? " ✓" : ""}` : "";
+  const label = trk.switching || switchingEngine ? "switching…" : (trk.delegate === ENGINE_NAMES[state.engine] ? "" : trk.delegate);
+  diag.textContent = `${ENGINE_NAMES[state.engine] || ""} ${label} · ` +
+    `${dstat.rate.toFixed(0)} fps · ${s.ms.toFixed(0)} ms · hand ${Math.round(dstat.found * 100)}%${pinchTxt} · ${vs}` +
+    (s.error ? ` · err: ${s.error}` : "") + " · tap = other engine";
+  autoFallback(now);
 }
+
+// Pinch = thumb tip (4) close to index tip (8), relative to hand size.
+// Hysteresis: pinched below PINCH_ON, released above PINCH_OFF.
+const PINCH_ON = 0.33, PINCH_OFF = 0.5;
+function updatePinch(res, h) {
+  const lm = res && res.landmarks;
+  if (!lm || lm.length < 21 || !res.size) { h.pinchDist = null; return; }
+  const { w, h: hh } = srcSize(), aspect = hh / w;
+  const d = Math.hypot(lm[4].x - lm[8].x, (lm[4].y - lm[8].y) * aspect) / res.size;
+  h.pinchDist = d;
+  if (!h.pinched && d < PINCH_ON) h.pinched = true;
+  else if (h.pinched && d > PINCH_OFF) h.pinched = false;
+  const a = toScreen(lm[4]), b = toScreen(lm[8]);
+  h.px = (a.x + b.x) / 2; h.py = (a.y + b.y) / 2;           // pinch point between the fingertips
+}
+
+const frameCv = document.createElement("canvas");
+const frameCtx = frameCv.getContext("2d", { willReadFrequently: true });
 
 function detectHand(now) {
   let res = null;
@@ -259,7 +352,15 @@ function detectHand(now) {
         state.lastVideoTime = video.currentTime;
         const t = Math.max(now, state.lastDetect + 1);   // tracker needs strictly increasing timestamps
         state.lastDetect = t;
-        try { res = state.tracker.detect(video, t) || null; }
+        // Hand the engines a plain canvas copy of the frame (max 640 px), not
+        // the hidden <video>: some Android GPUs give black frames for a hidden
+        // video, and some libraries misread a video's size. Same aspect ratio,
+        // so normalised coordinates are unchanged.
+        const sc = Math.min(1, 640 / Math.max(video.videoWidth, video.videoHeight));
+        const fw = Math.round(video.videoWidth * sc), fh = Math.round(video.videoHeight * sc);
+        if (frameCv.width !== fw || frameCv.height !== fh) { frameCv.width = fw; frameCv.height = fh; }
+        frameCtx.drawImage(video, 0, 0, fw, fh);
+        try { res = state.tracker.detect(frameCv, t) || null; }
         catch (e) { if (!state.detectErr) console.warn("detect() failed", e); state.detectErr = e; res = null; }
       } else res = state.res;                              // same frame: reuse last result
     }
@@ -273,6 +374,12 @@ function detectHand(now) {
     h.x = clamp(p.x, 0, state.W); h.y = clamp(p.y, 0, state.H);
     h.closure = clamp(+res.closure || 0, 0, 1);
     h.gesture = res.gesture; h.seen = true; h.lastSeen = now;
+    h.motion = !!res.motion;
+    if (state.mock) {                       // touch mode: finger down = pinch, at the finger
+      h.pinched = !!state.mock.down; h.pinchDist = null; h.px = h.x; h.py = h.y;
+    } else if (h.motion) {
+      h.pinched = false; h.pinchDist = null; h.px = h.x; h.py = h.y;
+    } else updatePinch(res, h);
   } else {
     h.seen = false;   // keep last position / closure
   }
@@ -521,21 +628,35 @@ function makeLevel3() {
   };
   const drop = () => { if (L.held) { L.held.vy = 0; L.held = null; } L.grabAt = -1e9; };
   L.start = now => { for (let i = 0; i < 4; i++) spawn(); L.endAt = now + ROUND_MS; };
+  const DWELL_MS = 800;
   L.update = (now, dt) => {
     const h = state.hand, Lo = L.layout(), ground = Lo.floor - Lo.cube / 2;
-    // grab hysteresis: > 0.6 closes, < 0.4 opens
-    if (h.seen) {
-      if (!L.grabbing && h.closure > 0.6) { L.grabbing = true; L.grabAt = now; }
-      else if (L.grabbing && h.closure < 0.4) L.grabbing = false;
+    // Grab point: between thumb and index tip (pinch), or the palm in motion mode.
+    const gx = h.px != null ? h.px : h.x, gy = h.py != null ? h.py : h.y;
+    if (h.motion) {
+      // Motion engine can't see fingers: hold still for 0.8 s to grab, again to drop.
+      if (!L.anchor || Math.hypot(gx - L.anchor.x, gy - L.anchor.y) > Lo.cube * 0.35) {
+        L.anchor = { x: gx, y: gy, t: now }; L.dwellFired = false;
+      }
+      if (h.seen && !L.dwellFired && now - L.anchor.t > DWELL_MS) {
+        L.dwellFired = true; L.grabbing = !L.held; if (L.grabbing) L.grabAt = now;
+      }
+    } else {
+      L.anchor = null;
+      // pinch thumb + index to grab, open them to drop
+      if (h.seen) {
+        if (!L.grabbing && h.pinched) { L.grabbing = true; L.grabAt = now; }
+        else if (L.grabbing && !h.pinched) L.grabbing = false;
+      }
     }
     if (L.held) {
       if (!h.seen) {
         if (now - h.lastSeen > LOST_DROP_MS) drop();   // hand lost: cube falls
       } else if (!L.grabbing) {
-        drop();                                          // opened the hand
+        drop();                                          // released the pinch
       } else {
         const prevX = L.held.x;
-        const nx = h.x, ny = Math.min(h.y, ground);
+        const nx = gx, ny = Math.min(gy, ground);
         const crossed = (prevX - Lo.wallX) * (nx - Lo.wallX) < 0;
         if (crossed && ny + Lo.cube / 2 > Lo.wallTop) {   // hit the wall below its top
           L.wallHits++; flash("Hit the wall – lift higher!"); drop();
@@ -544,10 +665,11 @@ function makeLevel3() {
     } else if (h.seen && L.grabbing && now - L.grabAt < GRAB_GRACE_MS) {
       // grab the nearest left-side cube under the cursor (shortly after closing the hand)
       let best = null, bd = Infinity;
+      const tol = Lo.cube * (h.motion ? 1.8 : 0.9);    // motion cursor is less precise
       for (const cb of L.cubes) {
         if (cb.side !== "L") continue;
-        const dx = Math.abs(cb.x - h.x), dy = Math.abs(cb.y - h.y);
-        if (dx < Lo.cube * 0.8 && dy < Lo.cube * 0.8 && dx + dy < bd) { bd = dx + dy; best = cb; }
+        const dx = Math.abs(cb.x - gx), dy = Math.abs(cb.y - gy);
+        if (dx < tol && dy < tol && dx + dy < bd) { bd = dx + dy; best = cb; }
       }
       if (best) { L.held = best; L.grabAt = -1e9; }
     }
@@ -584,6 +706,19 @@ function makeLevel3() {
       g.strokeStyle = cb === L.held ? "#ffffff" : "rgba(0,0,0,0.35)"; g.lineWidth = 2;
       g.strokeRect(cb.x - s / 2, cb.y - s / 2, s, s);
     }
+    // grab point marker: pinch point (amber when pinched) / dwell progress in motion mode
+    const h = state.hand;
+    if (h.seen && h.px != null) {
+      g.save();
+      g.lineWidth = 3; g.strokeStyle = L.grabbing ? "#ffb347" : "rgba(255,255,255,0.9)";
+      g.beginPath(); g.arc(h.px, h.py, L.grabbing ? 9 : 13, 0, Math.PI * 2); g.stroke();
+      if (h.motion && L.anchor && !L.dwellFired) {
+        const f = clamp((state.lastNow - L.anchor.t) / DWELL_MS, 0, 1);
+        g.strokeStyle = "#ffb347"; g.lineWidth = 5;
+        g.beginPath(); g.arc(h.px, h.py, 24, -Math.PI / 2, -Math.PI / 2 + f * Math.PI * 2); g.stroke();
+      }
+      g.restore();
+    }
   };
   L.results = v => ({ title: "Time!",
     text: `You moved ${v} cube${v === 1 ? "" : "s"} over the wall` +
@@ -611,8 +746,11 @@ function goMenu() {
   endLevel();
   state.screen = "menu";
   for (const n of [1, 2, 3]) { const b = loadBest(n); $("best" + n).textContent = b == null ? "" : LEVELS[n].fmt(b); }
-  $("modeLine").textContent = state.useCamera ? "Camera mode – show your hand to the camera."
-    : "Touch test mode – your finger is the hand; touch = fist, lift = open.";
+  $("modeLine").textContent = !state.useCamera
+    ? "Touch test mode – your finger is the hand; touch = fist / pinch, lift = open."
+    : state.engine === "motion"
+      ? "Motion mode – move your hand to steer; hold still to grab or drop. Levels 1–2 need a hand model."
+      : "Camera mode – show your hand to the camera.";
   show("scrMenu");
 }
 
